@@ -8,6 +8,7 @@ use std::{
     cmp::{max, min},
     collections::{HashMap, VecDeque},
     convert::TryFrom,
+    intrinsics::saturating_add,
     sync::Arc,
 };
 use tokio::{
@@ -29,7 +30,7 @@ use crate::{
         util::{abs_diff, ewma, generate_sequential_identifiers},
     },
 };
-use std::time::Duration;
+use tokio::time::Duration;
 
 // For simplicity's sake, let us assume no packet will ever exceed the
 // Discv5 maximum transfer unit of 1280 bytes.
@@ -38,28 +39,28 @@ const GAIN: f64 = 1.0;
 const ALLOWED_INCREASE: u32 = 1;
 const MIN_CWND: u32 = 2; // minimum congestion window size
 const INIT_CWND: u32 = 2; // init congestion window size
-const MIN_CONGESTION_TIMEOUT: u64 = 500; // 500 ms
-const MAX_CONGESTION_TIMEOUT: u64 = 60_000; // one minute
+const MIN_CONGESTION_TIMEOUT: Duration = Duration::from_millis(500); // 500 ms
+const MAX_CONGESTION_TIMEOUT: Duration = Duration::from_secs(60); // one minute
 const MAX_RETRANSMISSION_RETRIES: u32 = 5; // discv5 socket maximum retransmission retries
 const WINDOW_SIZE: u32 = 1024 * 1024; // local receive window size
 
 // Maximum time (in microseconds) to wait for incoming packets when the send window is full
-const PRE_SEND_TIMEOUT: u32 = 500_000;
+const PRE_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
 const MAX_DISCV5_PACKET_SIZE: u32 = 1280;
 const MAX_DISCV5_HEADER_SIZE: usize = 80;
 // Size of the payload length in uTP message
 const PAYLOAD_LENGTH_SIZE: usize = 32;
 // Buffering delay that the uTP accepts on the up-link. Currently the delay target is set to 100 ms.
-const CCONTROL_TARGET: f64 = 100_000.0;
+const CCONTROL_TARGET: Duration = Duration::from_millis(100);
 
 const BASE_HISTORY: usize = 10; // base delays history size
                                 // Maximum age of base delay sample (60 seconds)
-const MAX_BASE_DELAY_AGE: Delay = Delay(60_000_000);
+const MAX_BASE_DELAY_AGE: Duration = Duration::from_secs(60);
 // Discv5 socket timeout in milliseconds
-const DISCV5_SOCKET_TIMEOUT: u64 = 25;
+const DISCV5_SOCKET_TIMEOUT: Duration = Duration::from_millis(25);
 /// uTP receive timeout in milliseconds
-const UTP_RECEIVE_TIMEOUT: u64 = 1000;
+const UTP_RECEIVE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// uTP connection id
 type ConnId = u16;
@@ -523,11 +524,11 @@ pub struct UtpStream {
     /// Sequence number of the last packet removed from the incoming buffer
     last_dropped: u16,
 
-    /// Round-trip time to remote peer
-    rtt: i32,
+    /// Round-trip time to remote peer (ms)
+    rtt: Duration,
 
-    /// Variance of the round-trip time to the remote peer
-    rtt_variance: i32,
+    /// Variance of the round-trip time to the remote peer (ms)
+    rtt_variance: Duration,
 
     /// Data from the latest packet not yet returned in `recv_from`
     pending_data: Vec<u8>,
@@ -539,10 +540,10 @@ pub struct UtpStream {
     current_delays: Vec<DelayDifferenceSample>,
 
     /// Difference between timestamp of the latest packet received and time of reception
-    their_delay: Delay,
+    their_delay: Duration,
 
     /// Current congestion timeout in milliseconds
-    congestion_timeout: u64,
+    congestion_timeout: Duration,
 
     /// Start of the current minute for sampling purposes
     last_rollover: Timestamp,
@@ -595,12 +596,12 @@ impl UtpStream {
             last_acked: 0,
             last_acked_timestamp: Timestamp::default(),
             last_dropped: 0,
-            rtt: 0,
-            rtt_variance: 0,
+            rtt: Duration::default(),
+            rtt_variance: Duration::default(),
             pending_data: Vec::new(),
             base_delays: VecDeque::with_capacity(BASE_HISTORY),
-            their_delay: Delay::default(),
-            congestion_timeout: 1000,
+            their_delay: Duration::default(),
+            congestion_timeout: Duration::from_millis(1000),
             last_rollover: Timestamp::default(),
             current_delays: Vec::with_capacity(8),
             recv_data_stream: Vec::new(),
@@ -656,7 +657,7 @@ impl UtpStream {
     pub async fn raw_receive(&mut self) -> Option<Packet> {
         // Listen on a channel for discovery utp packet
         match timeout(
-            Duration::from_millis(DISCV5_SOCKET_TIMEOUT),
+            DISCV5_SOCKET_TIMEOUT,
             self.discv5_rx.write_with_warn().await.recv(),
         )
         .await
@@ -846,7 +847,7 @@ impl UtpStream {
 
     /// Handle uTP socket timeout
     async fn handle_receive_timeout(&mut self) -> anyhow::Result<()> {
-        self.congestion_timeout *= 2;
+        self.congestion_timeout = self.congestion_timeout.saturating_mul(2);
         self.cwnd = INIT_CWND * MAX_DISCV5_PACKET_SIZE;
 
         // There are four possible cases here:
@@ -1353,14 +1354,12 @@ impl UtpStream {
         self.cwnd = max(self.cwnd, MIN_CWND * MAX_DISCV5_PACKET_SIZE);
     }
 
-    fn update_congestion_timeout(&mut self, current_delay: i32) {
-        let delta = self.rtt - current_delay;
-        self.rtt_variance += (delta.abs() - self.rtt_variance) / 4;
+    fn update_congestion_timeout(&mut self, current_delay: Duration) {
+        let delta = self.rtt.saturating_sub(current_delay);
+        self.rtt_variance += (delta - self.rtt_variance) / 4;
         self.rtt += (current_delay - self.rtt) / 8;
-        self.congestion_timeout = max(
-            (self.rtt + self.rtt_variance * 4) as u64,
-            MIN_CONGESTION_TIMEOUT,
-        );
+        let rtt_with_variance = self.rtt.saturating_add(self.rtt_variance.saturating_mul(4));
+        self.congestion_timeout = Duration::max(rtt_with_variance, MIN_CONGESTION_TIMEOUT);
         self.congestion_timeout = min(self.congestion_timeout, MAX_CONGESTION_TIMEOUT);
     }
 
@@ -1421,7 +1420,7 @@ impl UtpStream {
                     recv_retries += 1;
 
                     if recv_retries > self.max_retransmission_retries {
-                        tokio::time::sleep(Duration::from_millis(UTP_RECEIVE_TIMEOUT)).await;
+                        tokio::time::sleep(UTP_RECEIVE_TIMEOUT).await;
                         self.handle_receive_timeout().await?;
                         return Ok(None);
                     }
